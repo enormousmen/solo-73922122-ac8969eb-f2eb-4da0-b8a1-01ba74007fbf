@@ -5,7 +5,9 @@
   ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK`` 控制；
 - WAL 模式 + busy_timeout：读不阻塞写，写事务串行化，并发提交安全；
 - 报告与其测点项目在同一事务内写入，失败整体回滚，不会留下半份报告；
-- 旧修订行永不删除，已提交报告始终可读取。
+- 隔离记录在 ``BEGIN IMMEDIATE`` 事务内完成“幂等检查 → 现行性检查 → 写入”，
+  失败整体回滚，不会改变既有判读所依据的数据；
+- 旧修订行与隔离记录永不删除，已提交报告及其隔离原因始终可读取。
 """
 
 from __future__ import annotations
@@ -31,6 +33,11 @@ CREATE TABLE IF NOT EXISTS report_items (
     value            REAL,                            -- type='value' 时的浓度
     detection_limit  REAL,                            -- type='nd' 时的检出限
     UNIQUE (report_id, pollutant)
+);
+CREATE TABLE IF NOT EXISTS quarantines (
+    report_id      INTEGER PRIMARY KEY REFERENCES reports(id) ON DELETE CASCADE,
+    reason         TEXT NOT NULL,                       -- 隔离原因（仪器故障复核等）
+    quarantined_at TEXT NOT NULL                        -- UTC ISO 时间戳
 );
 CREATE INDEX IF NOT EXISTS idx_reports_station_date ON reports (station, sampling_date);
 CREATE INDEX IF NOT EXISTS idx_items_report ON report_items (report_id);

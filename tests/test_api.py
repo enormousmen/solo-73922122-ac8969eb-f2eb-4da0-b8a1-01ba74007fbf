@@ -60,6 +60,14 @@ def interpret(client, station, end, pollutant, limit):
     )
 
 
+def quarantine(client, report_id, reason="仪器故障复核"):
+    return client.post(f"/reports/{report_id}/quarantine", json={"reason": reason})
+
+
+def current_id(client, station, date):
+    return client.get(f"/reports/{station}/{date}").json()["report_id"]
+
+
 # ---------------- 提交与修订语义 ----------------
 
 
@@ -344,6 +352,150 @@ def test_failed_submission_leaves_nothing(client):
     assert len(revs) == 1
 
 
+# ---------------- 隔离 ----------------
+
+
+def test_quarantine_current_report_blocks_day_without_fallback(client):
+    # 第 1 天 rev1 含错误浓度 100.0，rev2 修正为 1.0；隔离 rev2 后不得回退 rev1
+    fill_week(client, "S1", END, "COD", [1.0] * 7)
+    first_day = END - dt.timedelta(days=6)
+    submit(client, "S1", first_day, 2, [val("COD", 100.0)])
+    rid = current_id(client, "S1", first_day)
+
+    r = quarantine(client, rid, "仪器故障复核：消解仪温度漂移")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["status"] == "quarantined"
+    assert body["report_id"] == rid
+    assert body["revision"] == 2
+    assert body["reason"] == "仪器故障复核：消解仪温度漂移"
+    assert body["quarantined_at"]
+
+    interp = interpret(client, "S1", END, "COD", 5.0).json()
+    assert interp["status"] == "insufficient_data"
+    assert interp["status_zh"] == "资料不足"
+    assert interp["mean"] is None
+    # 列出隔离日期与报告 ID，且不回退旧修订
+    assert interp["quarantined"] == [
+        {"date": str(first_day), "revision": 2, "report_id": rid}
+    ]
+    used = {rv["date"] for rv in interp["revisions"]}
+    assert str(first_day) not in used  # 被隔离的当日不参与判读
+    assert len(interp["revisions"]) == 6
+
+
+def test_quarantine_repeat_returns_original_record(client):
+    submit(client, "S1", "2026-11-10", 1, [val("COD", 1.0)])
+    rid = current_id(client, "S1", "2026-11-10")
+    r1 = quarantine(client, rid, "原始原因")
+    assert r1.status_code == 201
+    # 重复隔离（即使原因不同）返回原记录，不覆盖
+    r2 = quarantine(client, rid, "另一个原因")
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "already_quarantined"
+    assert r2.json()["reason"] == "原始原因"
+    assert r2.json()["quarantined_at"] == r1.json()["quarantined_at"]
+
+
+def test_quarantine_repeat_allowed_after_newer_revision(client):
+    submit(client, "S1", "2026-11-10", 1, [val("COD", 1.0)])
+    rid = current_id(client, "S1", "2026-11-10")
+    r1 = quarantine(client, rid, "原始原因")
+    assert r1.status_code == 201
+    # 补交更高修订后，旧修订的重复隔离仍返回原结果
+    submit(client, "S1", "2026-11-10", 2, [val("COD", 2.0)])
+    r2 = quarantine(client, rid, "别的原因")
+    assert r2.status_code == 200
+    assert r2.json()["reason"] == "原始原因"
+    assert r2.json()["quarantined_at"] == r1.json()["quarantined_at"]
+
+
+def test_quarantine_old_revision_never_quarantined_rejected(client):
+    submit(client, "S1", "2026-11-10", 1, [val("COD", 1.0)])
+    old_id = current_id(client, "S1", "2026-11-10")
+    submit(client, "S1", "2026-11-10", 2, [val("COD", 2.0)])
+    r = quarantine(client, old_id)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "not_current_revision"
+    assert r.json()["detail"]["current_revision"] == 2
+    # 旧修订仍未被隔离
+    detail = client.get("/reports/S1/2026-11-10", params={"revision": 1}).json()
+    assert detail["quarantine"] is None
+
+
+def test_quarantine_nonexistent_report(client):
+    r = quarantine(client, 999999)
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "not_found"
+
+
+@pytest.mark.parametrize("payload", [{}, {"reason": ""}, {"reason": "   "}, {"reason": "x", "extra": 1}])
+def test_quarantine_invalid_request_rejected(client, payload):
+    submit(client, "S1", "2026-11-10", 1, [val("COD", 1.0)])
+    rid = current_id(client, "S1", "2026-11-10")
+    r = client.post(f"/reports/{rid}/quarantine", json=payload)
+    assert r.status_code == 422, r.text
+
+
+def test_higher_revision_restores_day_and_old_keeps_reason(client):
+    fill_week(client, "S1", END, "COD", [1.0] * 7)
+    first_day = END - dt.timedelta(days=6)
+    rid = current_id(client, "S1", first_day)
+    quarantine(client, rid, "仪器故障复核")
+    assert interpret(client, "S1", END, "COD", 5.0).json()["status"] == "insufficient_data"
+
+    # 补交更高修订：该日重新参与判读
+    submit(client, "S1", first_day, 2, [val("COD", 0.5)])
+    body = interpret(client, "S1", END, "COD", 5.0).json()
+    assert body["status"] == "compliant"
+    assert body["quarantined"] == []
+    revs = {r["date"]: r["revision"] for r in body["revisions"]}
+    assert revs[str(first_day)] == 2
+
+    # 报告详情仍可查看旧修订的隔离原因；新修订无隔离记录
+    old = client.get(f"/reports/S1/{first_day}", params={"revision": 1}).json()
+    assert old["is_current"] is False
+    assert old["quarantine"]["reason"] == "仪器故障复核"
+    assert old["quarantine"]["quarantined_at"]
+    cur = client.get(f"/reports/S1/{first_day}").json()
+    assert cur["revision"] == 2
+    assert cur["quarantine"] is None
+
+    # 修订列表标注隔离状态
+    revs_list = client.get(f"/reports/S1/{first_day}/revisions").json()["revisions"]
+    assert [(r["revision"], r["is_quarantined"]) for r in revs_list] == [(1, True), (2, False)]
+
+
+def test_failed_quarantine_does_not_change_interpretation(client):
+    fill_week(client, "S1", END, "COD", [1.0] * 7)
+    first_day = END - dt.timedelta(days=6)
+    submit(client, "S1", first_day, 2, [val("COD", 1.0)])
+    before = interpret(client, "S1", END, "COD", 5.0).json()
+
+    old_id = client.get(f"/reports/S1/{first_day}", params={"revision": 1}).json()["report_id"]
+    # 三种失败：旧修订新隔离(409)、不存在(404)、缺原因(422)
+    assert quarantine(client, old_id).status_code == 409
+    assert quarantine(client, 999999).status_code == 404
+    assert client.post(f"/reports/{old_id}/quarantine", json={}).status_code == 422
+
+    # 失败的隔离不改变任何判读结果（响应逐字段一致）
+    after = interpret(client, "S1", END, "COD", 5.0).json()
+    assert after == before
+    assert after["status"] == "compliant"
+
+
+def test_quarantine_response_visible_in_report_detail(client):
+    submit(client, "S1", "2026-11-10", 1, [val("COD", 1.0)])
+    rid = current_id(client, "S1", "2026-11-10")
+    quarantine(client, rid, "泵采样管破裂")
+    detail = client.get("/reports/S1/2026-11-10").json()
+    assert detail["quarantine"] == {
+        "reason": "泵采样管破裂",
+        "quarantined_at": detail["quarantine"]["quarantined_at"],
+    }
+    assert detail["items"] == [{"type": "value", "pollutant": "COD", "value": 1.0}]
+
+
 # ---------------- 并发 ----------------
 
 
@@ -450,3 +602,124 @@ def test_concurrent_submit_and_interpret(client):
     # 判读始终基于同一时点的七份现行日报：最终所用修订号一致
     body = interpret(client, "S1", END, "COD", 5.0).json()
     assert [r["revision"] for r in body["revisions"]] == [1] * 6 + [11]
+
+
+def test_concurrent_identical_quarantines(client):
+    submit(client, "S1", "2026-11-10", 1, [val("COD", 1.0)])
+    rid = current_id(client, "S1", "2026-11-10")
+    results = []
+
+    def worker():
+        c = TestClient(client.app)
+        r = c.post(f"/reports/{rid}/quarantine", json={"reason": "仪器故障复核"})
+        results.append((r.status_code, r.json()))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    codes = sorted(code for code, _ in results)
+    assert codes.count(201) == 1
+    assert codes.count(200) == 7
+    # 全部返回同一份隔离记录（同一时间戳与原因）
+    assert len({(b["reason"], b["quarantined_at"]) for _, b in results}) == 1
+    detail = client.get("/reports/S1/2026-11-10").json()
+    assert detail["quarantine"]["reason"] == "仪器故障复核"
+
+
+def test_concurrent_quarantine_submit_and_interpret(client):
+    fill_week(client, "S1", END, "COD", [1.0] * 7)
+    first_day = END - dt.timedelta(days=6)
+    rid1 = current_id(client, "S1", first_day)
+    errors = []
+    quarantine_codes = []
+
+    def quarantiner():
+        c = TestClient(client.app)
+        for _ in range(10):
+            r = c.post(f"/reports/{rid1}/quarantine", json={"reason": "仪器故障复核"})
+            # 合法线性化结果：201 隔离成功 / 200 幂等复用 /
+            # 409 补交的更高修订先落库（旧修订从未隔离，不得新隔离）
+            if r.status_code not in (200, 201, 409):
+                errors.append(r.text)
+            else:
+                quarantine_codes.append(r.status_code)
+
+    def submitter():
+        c = TestClient(client.app)
+        for rev in range(2, 8):
+            c.post(
+                "/reports",
+                json={
+                    "station": "S1",
+                    "sampling_date": str(first_day),
+                    "revision": rev,
+                    "items": [val("COD", 1.0)],
+                },
+            )
+
+    def reader():
+        c = TestClient(client.app)
+        for _ in range(30):
+            r = c.get(
+                "/interpretation",
+                params={
+                    "station": "S1",
+                    "end_date": str(END),
+                    "pollutant": "COD",
+                    "limit": 5.0,
+                },
+            )
+            if r.status_code != 200:
+                errors.append(r.text)
+                continue
+            b = r.json()
+            used = {rv["date"] for rv in b["revisions"]}
+            quar = {q["date"] for q in b["quarantined"]}
+            missing = set(b["missing_dates"])
+            # 同一快照：七天在 所用修订/隔离/缺失 三类中恰好各出现一次
+            if not (used.isdisjoint(quar) and used.isdisjoint(missing) and quar.isdisjoint(missing)):
+                errors.append(f"overlap: {b}")
+            elif len(used) + len(quar) + len(missing) != 7:
+                errors.append(f"incomplete window: {b}")
+            # 有隔离日必为资料不足；无隔离且七天齐全必为达标（浓度均 1.0）
+            if quar:
+                if b["status"] != "insufficient_data" or b["mean"] is not None:
+                    errors.append(f"quarantined but not insufficient: {b}")
+                if [q["report_id"] for q in b["quarantined"]] != [rid1]:
+                    errors.append(f"wrong quarantined report: {b}")
+            elif not missing and len(used) == 7:
+                if b["status"] != "compliant":
+                    errors.append(f"unexpected status: {b}")
+
+    threads = (
+        [threading.Thread(target=quarantiner), threading.Thread(target=submitter)]
+        + [threading.Thread(target=reader) for _ in range(4)]
+    )
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+
+    # 隔离结果只有两种合法线性化：{一次 201 + 其余 200} 或 {全部 409}
+    assert sorted(set(quarantine_codes)) in ([200, 201], [409])
+    assert quarantine_codes.count(201) <= 1
+
+    # 终态与隔离竞争结果一致：rev7 为现行且未隔离，判读恢复达标
+    body = interpret(client, "S1", END, "COD", 5.0).json()
+    assert body["status"] == "compliant"
+    assert body["quarantined"] == []
+    revs = {r["date"]: r["revision"] for r in body["revisions"]}
+    assert revs[str(first_day)] == 7
+    old = client.get(f"/reports/S1/{first_day}", params={"revision": 1}).json()
+    if 201 in quarantine_codes:
+        # 隔离曾成功：旧修订详情保留隔离原因，重复隔离仍返回原记录
+        assert old["quarantine"]["reason"] == "仪器故障复核"
+        r = quarantine(client, rid1, "别的原因")
+        assert r.status_code == 200 and r.json()["reason"] == "仪器故障复核"
+    else:
+        # 补报全部抢先：rev1 从未被隔离
+        assert old["quarantine"] is None

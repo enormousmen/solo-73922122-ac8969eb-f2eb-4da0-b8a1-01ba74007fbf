@@ -8,7 +8,9 @@
 - mean_hi <= 限值  → 均值必定不高于限值 → 达标 compliant；
 - mean_lo >  限值  → 均值必定高于限值   → 超标 exceeds；
 - 其余（区间跨过限值）              → 待复核 pending_review；
-- 缺日或缺项目                     → 资料不足 insufficient_data。
+- 缺日或缺项目                     → 资料不足 insufficient_data；
+- 现行报告被隔离的当日不参与判读（不回退旧修订），
+  整窗判读为资料不足并列出隔离日期与 report_id。
 
 均值上下界用 Fraction 精确计算（按提交数值的十进制语义），
 避免 0.1 这类十进制数在边界比较时的舍入歧义。
@@ -80,11 +82,15 @@ def interpret_window(
 
     days: 按日期升序的 7 个元素，每个为
         {"date": str, "revision": int|None, "report_id": int|None,
-         "items": {pollutant: {"type","value","detection_limit"}} | None}
+         "items": {pollutant: {"type","value","detection_limit"}} | None,
+         "quarantine": {"reason": str, "quarantined_at": str} | None}
+    quarantine 非空表示该日现行报告已被隔离：当日不参与判读
+    （不回退旧修订），整窗结论为资料不足。
     """
     revisions: list[dict[str, Any]] = []
     missing_dates: list[str] = []
     missing_pollutant_dates: list[str] = []
+    quarantined: list[dict[str, Any]] = []
     lo = Fraction(0)
     hi = Fraction(0)
     any_nd = False
@@ -92,6 +98,15 @@ def interpret_window(
     for day in days:
         if day["report_id"] is None:
             missing_dates.append(day["date"])
+            continue
+        if day["quarantine"] is not None:
+            quarantined.append(
+                {
+                    "date": day["date"],
+                    "revision": day["revision"],
+                    "report_id": day["report_id"],
+                }
+            )
             continue
         revisions.append(
             {"date": day["date"], "revision": day["revision"], "report_id": day["report_id"]}
@@ -112,9 +127,10 @@ def interpret_window(
         "revisions": revisions,
         "missing_dates": missing_dates,
         "missing_pollutant_dates": missing_pollutant_dates,
+        "quarantined": quarantined,
     }
 
-    if missing_dates or missing_pollutant_dates:
+    if missing_dates or missing_pollutant_dates or quarantined:
         result["status"] = STATUS_INSUFFICIENT
         result["mean"] = None
         return result

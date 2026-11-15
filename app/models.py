@@ -13,6 +13,8 @@ PosFinite = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 # SQLite INTEGER 上限
 Revision = Annotated[int, Field(strict=True, ge=1, le=9223372036854775807)]
+# 隔离原因：非空、去首尾空白
+Reason = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 
 class ValueItem(BaseModel):
@@ -78,3 +80,23 @@ class SubmitResponse(BaseModel):
     revision: int
     status: str  # created | reused
     superseded_revision: Optional[int] = None
+
+
+class QuarantineRequest(BaseModel):
+    """隔离某份现行报告（仪器故障复核等），须记录原因。"""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"reason": "仪器故障复核：COD 消解仪温度漂移"}]},
+    )
+    reason: Reason
+
+
+class QuarantineResponse(BaseModel):
+    report_id: int
+    station: str
+    sampling_date: str
+    revision: int
+    reason: str
+    quarantined_at: str
+    status: str  # quarantined | already_quarantined

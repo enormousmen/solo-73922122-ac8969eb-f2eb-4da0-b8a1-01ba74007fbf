@@ -2,8 +2,9 @@
 
 实验室按站点、采样日提交包含各污染物的完整日报（带递增修订号），系统按
 “同一已提交时点的七份现行日报”对连续七天平均浓度做限值判读，辅助决定
-是否复采。技术栈：FastAPI + SQLite（WAL），交付可启动的 Docker Compose
-环境，Swagger UI（`/docs`）可直接操作提交与判读。
+是否复采。仪器故障复核时，可按 `report_id` 隔离受影响的现行日报修订，
+避免错误浓度进入七日判读。技术栈：FastAPI + SQLite（WAL），交付可启动的
+Docker Compose 环境，Swagger UI（`/docs`）可直接操作提交、隔离与判读。
 
 ## 快速开始
 
@@ -59,6 +60,26 @@ uvicorn app.main:app --reload   # http://localhost:8000/docs
 
 缺省返回现行（最高修订）报告；指定 `revision` 读取历史修订。
 `GET /reports/{station}/{sampling_date}/revisions` 列出全部修订。
+响应中的 `quarantine` 字段给出该修订的隔离原因与隔离时间（未隔离为
+`null`）；历史修订的隔离记录永不删除，始终可查。
+
+### `POST /reports/{report_id}/quarantine` —— 隔离现行报告
+
+仪器故障复核时暂停使用某份日报修订：
+
+```json
+{"reason": "仪器故障复核：COD 消解仪温度漂移"}
+```
+
+| 情形 | 结果 |
+| --- | --- |
+| 报告为现行修订，首次隔离 | `201` 记录原因与隔离时间 |
+| 同一报告重复隔离（即使之后已有新修订） | `200` 幂等返回原隔离记录，不覆盖原因 |
+| 旧修订从未隔离过 | `409 not_current_revision`，不得新隔离 |
+| 报告不存在 | `404` |
+
+隔离只针对该 `report_id` 对应的修订：补交更高修订后，该日重新参与判读，
+旧修订的隔离原因仍可在报告详情中查看。
 
 ### `GET /interpretation` —— 判读
 
@@ -71,6 +92,8 @@ curl 'http://localhost:8000/interpretation?station=ST-01&end_date=2026-11-14&pol
 判读规则（窗口为结束日向前连续 7 天，取同一已提交时点各日现行日报）：
 
 - 缺日或当天报告缺该污染物 → `insufficient_data`（资料不足）；
+- 当天现行报告被隔离 → 该日不参与判读（**不回退**旧修订），整窗
+  `insufficient_data`，响应的 `quarantined` 列出隔离日期与 `report_id`；
 - “未检出”按半开区间 `[0, 检出限)` 参与均值，实测值即点值；
 - 均值必定不高于限值（区间上界 ≤ 限值）→ `compliant`（达标）；
 - 均值必定高于限值（区间下界 > 限值）→ `exceeds`（超标）；
@@ -87,12 +110,15 @@ curl 'http://localhost:8000/interpretation?station=ST-01&end_date=2026-11-14&pol
   "mean": {"lower": 8.1, "upper": 9.4, "upper_exclusive": true},
   "revisions": [{"date": "2026-11-08", "revision": 2, "report_id": 3}, "..."],
   "missing_dates": [], "missing_pollutant_dates": [],
+  "quarantined": [{"date": "2026-11-10", "revision": 3, "report_id": 9}],
   "snapshot_seq": 42
 }
 ```
 
-`revisions` 即判读所用的各日修订号；`snapshot_seq` 为判读使用的已提交
-时点（报告提交顺序号），均值上下界用精确有理数计算，边界比较无舍入歧义。
+`revisions` 即判读所用的各日修订号；`quarantined` 为窗口内被隔离的现行
+报告（非空时结论必为 `insufficient_data`）；`snapshot_seq` 为判读使用的
+已提交时点（报告提交顺序号），均值上下界用精确有理数计算，边界比较无
+舍入歧义。
 
 ## 并发与一致性设计
 
@@ -100,8 +126,11 @@ curl 'http://localhost:8000/interpretation?station=ST-01&end_date=2026-11-14&pol
 - 提交在 `BEGIN IMMEDIATE` 事务内完成“检查当前修订 → 写入报告与项目”，
   并发下检查与写入不会交错；`(station, sampling_date, revision)` 唯一约束
   兜底，同修订并发重传只有一份落库，其余幂等复用；
-- 判读在单个读事务内完成，七份日报来自同一已提交时点，不受并发提交影响；
-- 历史修订只增不改，已提交报告始终可读取。
+- 隔离同样在 `BEGIN IMMEDIATE` 事务内完成“幂等检查 → 现行性检查 → 写入”，
+  与补交修订串行化；失败的隔离整体回滚，不改变既有判读所依据的数据；
+- 判读在单个读事务内完成，七份日报的所用修订、隔离状态与结论来自同一
+  已提交时点，不受并发提交/隔离影响；
+- 历史修订与隔离记录只增不改，已提交报告及其隔离原因始终可读取。
 
 ## 目录结构
 
